@@ -1,0 +1,767 @@
+'use strict';
+
+var rotation = 0;
+
+var fs = require('fs');
+var glob = require('glob');
+var path = require('path');
+var PNG = require('pngjs').PNG;
+var usleep = require('sleep').usleep;
+var ioctl = require('ioctl');
+
+function sleep(s) {
+  usleep(s * 1000000);
+}
+
+// find sense hat matrix framebuffer
+var fb = findFB();
+
+function findFB() {
+  try {
+    return '/dev/' + glob.sync('/sys/class/graphics/fb*').filter(function (framebuffer) {
+      return fs.existsSync(path.join(framebuffer, 'name'));
+    }).find(function (framebuffer) {
+      return fs.readFileSync(path.join(framebuffer, 'name')).toString().trim() === 'RPi-Sense FB';
+    }).split('/').pop();
+  } catch (error) {
+    throw Error('Cannot detect RPi-Sense FB device');
+  }
+}
+
+// Decodes 16 bit RGB565 into array [R,G,B]
+function unpack(n) {
+  var r = (n & 0xF800) >> 11;
+  var g = (n & 0x7E0) >> 5;
+  var b = n & 0x1F;
+  return [r << 3, g << 2, b << 3];
+}
+
+// Encodes array [R, G, B] into 16 bit RGB565
+function pack(rgb) {
+  if (rgb.length != 3) {
+    throw Error('length = ' + rgb.lenth + ' violates length = 3');
+  }
+
+  var r = rgb[0] >> 3 & 0x1F;
+  var g = rgb[1] >> 2 & 0x3F;
+  var b = rgb[2] >> 3 & 0x1F;
+  return (r << 11) + (g << 5) + b;
+}
+
+// Sets the LED matrix rotation for viewing, adjust if the Pi is upside
+// down or sideways. 0 is with the Pi HDMI port facing downwards
+function setRotationSync(r) {
+  var redraw = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : true;
+
+  r = checkAngle(r);
+
+  if (!redraw) {
+    rotation = r;
+    return;
+  }
+
+  var pixels = getPixelsSync();
+  rotation = r;
+  setPixelsSync(pixels);
+}
+
+function setRotation(r) {
+  var redraw = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : true;
+  var callback = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : function () {};
+
+  rotation = checkAngle(r);
+
+  if (!redraw) return callback(null);
+
+  getPixels(function (error, pixels) {
+    if (error) return callback(error);
+    setPixels(pixels, callback);
+  });
+}
+
+function checkAngle() {
+  var r = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
+
+  if (r < 0) r += 360; // negative angle for counterclockwise rotation
+  if (!(r % 90 === 0 && r >= 0 && r < 360)) {
+    console.error('Rotation must be 0, 90, 180 or 270 degrees');
+    return rotation;
+  }
+  return r;
+}
+
+// Map (x, y) into rotated absolute byte position
+function pos(x, y) {
+  var pixMap = {
+    0: function _(x, y) {
+      return y * 8 + x;
+    },
+    90: function _(x, y) {
+      return y + (7 - x) * 8;
+    },
+    180: function _(x, y) {
+      return (7 - y) * 8 + (7 - x);
+    },
+    270: function _(x, y) {
+      return 7 - y + x * 8;
+    }
+  };
+  return pixMap[rotation](x, y) * 2;
+}
+
+// Returns a array of [R,G,B] representing the pixel specified by x and y
+// on the LED matrix. Top left = 0,0 Bottom right = 7,7
+function getPixelSync(x, y) {
+  try {
+    checkXY(x, y);
+  } catch (error) {
+    console.log(error.message);
+    return;
+  }
+
+  // Two bytes per pixel in fb memory, 16 bit RGB565
+  var fd = fs.openSync(fb, 'r');
+  var buf = Buffer.alloc(2);
+  fs.readSync(fd, buf, 0, 2, pos(x, y));
+  fs.closeSync(fd);
+  return unpack(buf.readUInt16LE(0));
+}
+
+function getPixel(x, y) {
+  var callback = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : function () {};
+
+  try {
+    checkXY(x, y);
+  } catch (error) {
+    return callback(error);
+  }
+
+  // Two bytes per pixel in fb memory, 16 bit RGB565
+  fs.open(fb, 'r', function (error, fd) {
+    fs.read(fd, Buffer.alloc(2), 0, 2, pos(x, y), function (error, bytesRead, buffer) {
+      fs.close(fd);
+      callback(error, unpack(buffer.readUInt16LE(0)));
+    });
+  });
+}
+
+function checkXY(x, y) {
+  if (x < 0 || x > 7) throw Error('x=' + x + ' violates 0 <= x <= 7');
+  if (y < 0 || y > 7) throw Error('y=' + y + ' violates 0 <= y <= 7');
+}
+
+// Updates the single [R,G,B] pixel specified by x and y on the LED matrix
+// Top left = 0,0 Bottom right = 7,7
+// e.g. sense.setPixel(x, y, r, g, b, callback)
+// or
+// pixel = [r, g, b]
+// sense.setPixell(x, y, pixel, callback)
+function setPixelSync(x, y, r, g, b) {
+  var rgb = rgbArray(r, g, b);
+
+  try {
+    checkXY(x, y);
+  } catch (error) {
+    return console.error(error.messsage);
+  }
+
+  var fd = fs.openSync(fb, 'w');
+  var buffer = Buffer.alloc(2);
+  buffer.writeUInt16LE(pack(rgb));
+  fs.writeSync(fd, buffer, 0, 2, pos(x, y));
+  fs.closeSync(fd);
+}
+
+function setPixel(x, y, r, g, b) {
+  var callback = arguments.length > 5 && arguments[5] !== undefined ? arguments[5] : function () {};
+
+  var rgb = rgbArray(r, g, b);
+
+  try {
+    checkXY(x, y);
+  } catch (error) {
+    return callback(error);
+  }
+
+  fs.open(fb, 'w', function (error, fd) {
+    var buffer = Buffer.alloc(2);
+    buffer.writeUInt16LE(pack(rgb));
+    fs.write(fd, buffer, 0, 2, pos(x, y), function (error) {
+      fs.close(fd);
+      callback(error, rgb);
+    });
+  });
+}
+
+// Accepts a array containing 64 smaller arays of [R,G,B] pixels and
+// updates the LED matrix. R,G,B elements must intergers between 0
+// and 255
+function setPixelsSync(pixels) {
+  var buf = toBuffer(pixels);
+
+  var fd = fs.openSync(fb, 'w');
+  fs.writeSync(fd, buf, 0, buf.length, 0);
+  fs.closeSync(fd);
+}
+
+function setPixels(pixels) {
+  var callback = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : function () {};
+
+  var buf = toBuffer(pixels);
+
+  fs.open(fb, 'w', function (error, fd) {
+    fs.write(fd, buf, 0, buf.length, 0, function (error) {
+      fs.close(fd);
+      callback(error, pixels);
+    });
+  });
+}
+
+function toBuffer(pixels) {
+  if (pixels.length != 64) {
+    console.error('Pixel arrays must have 64 elements');
+    pixels = new Array(64).fill([0, 0, 0]);
+  }
+
+  return pixels.reduce(function (buffer, rgb, index) {
+    var y = Math.floor(index / 8);
+    var x = index % 8;
+    buffer.writeUInt16LE(pack(checkColors(rgb)), pos(x, y));
+    return buffer;
+  }, Buffer.alloc(128)); // 8 x 8 pixels x 2 bytes
+}
+
+//  Returns a array containing 64 smaller arrays of [R,G,B] pixels
+//  representing what is currently displayed on the LED matrix
+function getPixelsSync() {
+  var fd = fs.openSync(fb, 'r');
+  var buf = fs.readFileSync(fd);
+  fs.closeSync(fd);
+  return bufferToPixels(buf);
+}
+
+function getPixels() {
+  var callback = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : function () {};
+
+  callback = typeof callback === 'function' ? callback : console.log;
+  fs.readFile(fb, function (error, buffer) {
+    callback(error, bufferToPixels(buffer));
+  });
+}
+
+function bufferToPixels(buffer) {
+  // Two bytes per pixel in fb memory, 16 bit RGB565
+  return Array.from(new Array(64), function (_, i) {
+    return unpack(buffer.readUInt16LE(pos(i % 8, Math.floor(i / 8))));
+  });
+}
+
+// Clears the LED matrix with a single colour, default is black / off
+// e.g. sense.clear()
+// or
+// sense.clear(r, g, b)
+// or
+// colour = [r, g, b]
+// sense.clear(colour)
+function clearSync(r, g, b) {
+  setPixelsSync(new Array(64).fill(rgbArray(r, g, b)));
+}
+
+function clear(r, g, b) {
+  var callback = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : function () {};
+
+  setPixels(new Array(64).fill(rgbArray(r, g, b)), callback);
+}
+
+function rgbArray() {
+  var r = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 0;
+  var g = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+  var b = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : 0;
+
+  if (Array.isArray(r)) {
+    return checkColors(r);
+  } else {
+    return checkColors([r, g, b]);
+  }
+}
+
+function checkColors(rgb) {
+  try {
+    if (!Array.isArray(rgb)) {
+      throw Error('Colors should be an rgb array');
+    }
+
+    if (rgb.length !== 3) {
+      throw Error('Colors should have red green & blue values');
+    }
+
+    if (rgb.some(function (color) {
+      return !Number.isInteger(color) || color < 0 || color > 255;
+    })) {
+      throw Error('RGB color ' + rgb + ' violates [0, 0, 0] < RGB < [255, 255, 255]');
+    }
+  } catch (error) {
+    console.error(error.message);
+    return [0, 0, 0]; // default to black
+  }
+
+  return rgb;
+}
+
+// Flip LED matrix horizontal
+function flipHSync() {
+  var redraw = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : true;
+
+  var flipped = horizontalMirror(getPixelsSync());
+  if (redraw) setPixelsSync(flipped);
+  return flipped;
+}
+
+function flipH() {
+  var redraw = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : true;
+  var callback = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : function () {};
+
+  getPixels(function (error, pixels) {
+    if (error) return console.error(error.message);
+    var flipped = horizontalMirror(pixels);
+    if (redraw) {
+      setPixels(flipped, callback);
+    } else {
+      return callback(null, flipped);
+    }
+  });
+}
+
+function horizontalMirror(pixels) {
+  return mirrorH(pixels, Math.sqrt(pixels.length));
+
+  function mirrorH(pixels, width) {
+    if (!pixels.length) return [];
+    return pixels.slice(0, width).reverse().concat(mirrorH(pixels.slice(width), width));
+  }
+}
+
+// Flip LED matrix vertical
+function flipVSync() {
+  var redraw = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : true;
+
+  var flipped = verticalMirror(getPixelsSync());
+  if (redraw) setPixelsSync(flipped);
+  return flipped;
+}
+
+function flipV() {
+  var redraw = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : true;
+  var callback = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : function () {};
+
+  getPixels(function (error, pixels) {
+    if (error) return console.error(error.message);
+    var flipped = verticalMirror(pixels);
+    if (redraw) {
+      setPixels(flipped, callback);
+    } else {
+      return callback(null, flipped);
+    }
+  });
+}
+
+function verticalMirror(pixels) {
+  return mirrorV(pixels, Math.sqrt(pixels.length));
+
+  function mirrorV(pixels, width) {
+    if (!pixels.length) return [];
+    return pixels.slice(pixels.length - width).concat(mirrorV(pixels.slice(0, pixels.length - width), width));
+  }
+}
+
+// Text asset files are rotated right through 90 degrees to allow blocks of
+// 40 contiguous pixels to represent one 5 x 8 character. These are stored
+// in a 8 x 640 pixel png image with characters arranged adjacently
+// Consequently we must rotate the pixel map left through 90 degrees to
+// compensate when drawing text
+var textAssets = 'sense_hat_text';
+var letters = loadTextAssets(__dirname + '/' + textAssets + '.png', __dirname + '/' + textAssets + '.txt');
+
+// Internal. Builds a character indexed object of pixels used by the
+// show_message function below
+function loadTextAssets(textImageFile, textFile) {
+  var textPixels = loadImageSync(textImageFile, false);
+  var loadedText = fs.readFileSync(textFile, 'utf8');
+
+  return loadedText.split('').reduce(function (letterPixels, char, i) {
+    letterPixels[char] = textPixels.slice(i * 40, (i + 1) * 40); // each character is 5x8 pixels
+    return letterPixels;
+  }, {});
+}
+
+var isBlack = function isBlack(rgb) {
+  return rgb.every(function (v) {
+    return v === 0;
+  });
+};
+
+// Internal. Trims white space pixels from the front and back of loaded
+// text characters
+function trimWhitespace(pixels) {
+  if (pixels.every(isBlack)) return pixels;
+  return trimBack(trimFront(pixels));
+
+  function trimFront(pixels) {
+    if (pixels.slice(0, 8).every(isBlack)) {
+      return trimFront(pixels.slice(8));
+    } else {
+      return pixels;
+    }
+  }
+
+  function trimBack(pixels) {
+    if (pixels.slice(-8).every(isBlack)) {
+      return trimBack(pixels.slice(0, -8));
+    } else {
+      return pixels;
+    }
+  }
+}
+
+function loadImageSync(filePath) {
+  var redraw = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : true;
+
+  try {
+    fs.accessSync(filePath);
+  } catch (error) {
+    throw Error(filePath + ' not found');
+  }
+
+  // load file & convert to pixel array
+  var buf = fs.readFileSync(filePath);
+  var png = PNG.sync.read(buf);
+  var pixels = pngTopixels(png);
+  if (redraw) setPixelsSync(pixels);
+  return pixels;
+}
+
+// Accepts a path to an 8 x 8 image file and updates the LED matrix with
+// the image
+function loadImage(filePath) {
+  var redraw = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : true;
+  var callback = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : function () {};
+
+  fs.access(filePath, readFile);
+
+  function readFile(error) {
+    if (error) return callback(filePath + ' not found');
+    fs.readFile(filePath, parsePNG);
+  }
+
+  function parsePNG(error, buf) {
+    if (error) return callback(filePath + ' could not be read');
+    new PNG().parse(buf, convertPNG);
+  }
+
+  function convertPNG(error, png) {
+    if (error) return callback('Could not parse PNG ' + error.message);
+
+    var pixels = pngTopixels(png);
+    if (redraw) {
+      setPixels(pixels, callback);
+    } else {
+      return callback(null, pixels);
+    }
+  }
+}
+
+function pngTopixels(png) {
+  return Array.from(new Array(png.width * png.height), function (_, i) {
+    return Array.from(new Array(3), function (_, j) {
+      return png.data[i * 4 + j];
+    });
+  });
+}
+
+// Internal. Safeguards the character indexed object for the
+// showMessage function below
+function getCharPixels(character) {
+  if (character.length === 1 && character in letters) {
+    return letters[character];
+  } else {
+    return letters['?'];
+  }
+}
+
+// Scrolls a string of text across the LED matrix using the specified
+// speed and Colors
+function showMessageSync(textString) {
+  var scrollSpeed = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0.1;
+  var textColor = arguments[2];
+  var backColor = arguments[3];
+
+  var pixels = scrollpixels(textString, textColor, backColor);
+
+  // We must rotate the pixel map left through 90 degrees when drawing
+  // text, see loadTextAssets
+  var previousRotation = rotation;
+  rotation = (rotation + 90) % 360;
+
+  function scroll(pixels) {
+    if (pixels.length < 64) return;
+    setPixelsSync(pixels.slice(0, 64));
+    sleep(scrollSpeed);
+    scroll(pixels.slice(8));
+  }
+
+  scroll(pixels);
+  rotation = previousRotation;
+}
+
+function showMessage(textString) {
+  var scrollSpeed = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0.1;
+  var textColor = arguments[2];
+  var backColor = arguments[3];
+  var callback = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : function () {};
+
+  var pixels = scrollpixels(textString, textColor, backColor);
+
+  // We must rotate the pixel map left through 90 degrees when drawing
+  // text, see loadTextAssets
+  var previousRotation = rotation;
+  rotation = (rotation + 90) % 360;
+
+  function scroll(pixels) {
+    if (pixels.length > 64) {
+      setPixels(pixels.slice(0, 64), function (error) {
+        if (error) {
+          rotation = previousRotation;
+          return callback(error);
+        }
+
+        setTimeout(scroll, scrollSpeed * 1000, pixels.slice(8)); // scroll(pixels.slice(8))
+      });
+    } else {
+      rotation = previousRotation;
+      return callback(null);
+    }
+  }
+
+  scroll(pixels);
+}
+
+function scrollpixels(textString) {
+  var textColor = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [255, 255, 255];
+  var backColor = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : [0, 0, 0];
+
+  var stringPadding = new Array(8).fill(backColor);
+  var letterPadding = new Array(16).fill(backColor);
+
+  return textString.split('').reduce(function (pixels, char) {
+    return pixels.concat(trimWhitespace(getCharPixels(char)).map(function (rgb) {
+      return isBlack(rgb) ? backColor : textColor;
+    })).concat(letterPadding);
+  }, stringPadding).concat(stringPadding);
+}
+
+// Displays a single text character on the LED matrix using the specified
+// Colors
+function showLetterSync(c, textColor, backColor) {
+  if (c.length !== 1) {
+    console.error('Only one character may be passed into showLetter');
+    return;
+  }
+
+  var pixels = letterpixels(c, textColor, backColor);
+
+  // We must rotate the pixel map right through 90 degrees when drawing
+  // text, see loadTextAssets
+  var previousRotation = rotation;
+  rotation = (rotation + 90) % 360;
+  setPixelsSync(pixels);
+  rotation = previousRotation;
+}
+
+function showLetter(c, textColor, backColor) {
+  var callback = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : function () {};
+
+  if (c.length !== 1) {
+    callback(Error('Only one character may be passed into this showLetter'));
+    return;
+  }
+
+  var pixels = letterpixels(c, textColor, backColor);
+
+  // We must rotate the pixel map right through 90 degrees when drawing
+  // text, see loadTextAssets
+  var previousRotation = rotation;
+  rotation = (rotation + 90) % 360;
+  setPixels(pixels, function (error) {
+    rotation = previousRotation;
+    callback(error);
+  });
+}
+
+function letterpixels(c) {
+  var textColor = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : [255, 255, 255];
+  var backColor = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : [0, 0, 0];
+
+  return new Array(8).fill(backColor).concat(getCharPixels(c).map(function (rgb) {
+    return isBlack(rgb) ? backColor : textColor;
+  })).concat(new Array(16).fill(backColor));
+}
+
+function flashMessageSync(message) {
+  var speed = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0.5;
+  var textColor = arguments[2];
+  var backColor = arguments[3];
+
+  message.split('').forEach(function (char) {
+    showLetterSync(char, textColor, backColor);
+    sleep(speed);
+  });
+}
+
+function flashMessage(textString) {
+  var speed = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0.5;
+  var textColor = arguments[2];
+  var backColor = arguments[3];
+  var callback = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : function () {};
+
+  function flash(message) {
+    if (message.length) {
+      showLetter(message[0], textColor, backColor, function (error) {
+        if (error) return console.error(error.message);
+        setTimeout(flash, speed * 1000, message.slice(1)); //flash(message.slice(1))
+      });
+    } else {
+      return callback(null);
+    }
+  }
+
+  flash(textString);
+}
+
+// ioctl codes
+var senseHatFBIOGetGamma = 61696;
+var senseHatFBIOSetGamma = 61697;
+var senseHatFBIOResetGamma = 61698;
+var senseHatFbGammaDefault = 0;
+var senseHatFbGammaLow = 1;
+
+function getGamma() {
+  var buffer = Buffer.alloc(32);
+  var fd = fs.openSync(fb, 'r');
+  ioctl(fd, senseHatFBIOGetGamma, buffer);
+  fs.closeSync(fd);
+  return Array.from(buffer.values());
+}
+
+function setGamma(GammaArray) {
+  try {
+    if (GammaArray.length != 32) throw Error('Gamma array must be of length 32');
+    if (!GammaArray.every(function (v) {
+      return v >= 0 && v <= 31;
+    })) throw Error('Gamma values must be between 0 and 31');
+  } catch (error) {
+    return console.error(error.message);
+  }
+  var fd = fs.openSync(fb, 'w');
+  ioctl(fd, senseHatFBIOSetGamma, Buffer.from(GammaArray));
+  fs.closeSync(fd);
+}
+
+function gammaReset() {
+  // Resets the LED matrix gamma correction to default
+  var fd = fs.openSync(fb, 'w');
+  ioctl(fd, senseHatFBIOResetGamma, senseHatFbGammaDefault);
+  fs.closeSync(fd);
+}
+
+function isLowLight() {
+  return getGamma().toString() === '0,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,3,3,3,4,4,5,5,6,6,7,7,8,8,9,10,10';
+}
+
+function setLowLight(bol) {
+  var cmd = bol ? senseHatFbGammaLow : senseHatFbGammaDefault;
+  var fd = fs.openSync(fb, 'w');
+  ioctl(fd, senseHatFBIOResetGamma, cmd);
+  fs.closeSync(fd);
+}
+
+var varg = function varg(fn, arity) {
+  return function () {
+    for (var _len = arguments.length, args = Array(_len), _key = 0; _key < _len; _key++) {
+      args[_key] = arguments[_key];
+    }
+
+    var cb = args[args.length - 1];
+    if (typeof cb !== 'function' || args.length >= arity) {
+      return fn.apply(undefined, args);
+    }
+    return fn.apply(undefined, args.slice(0, -1).concat(new Array(arity - args.length).fill(undefined), cb));
+  };
+};
+
+module.exports = {
+  clear: varg(clear, 4),
+  setPixel: varg(setPixel, 6),
+  getPixel: getPixel,
+  setPixels: setPixels,
+  getPixels: getPixels,
+  flipH: varg(flipH, 2),
+  flipV: varg(flipV, 2),
+  setRotation: varg(setRotation, 3),
+  showMessage: varg(showMessage, 5),
+  flashMessage: varg(flashMessage, 5),
+  showLetter: varg(showLetter, 4),
+  loadImage: varg(loadImage, 3),
+  get rotation() {
+    return rotation;
+  },
+  set rotation(r) {
+    setRotation(r, true);
+  },
+  get gamma() {
+    return getGamma();
+  },
+  set gamma(arr) {
+    setGamma(arr);
+  },
+  gammaReset: gammaReset,
+  get lowLight() {
+    return isLowLight();
+  },
+  set lowLight(bol) {
+    return setLowLight(bol);
+  },
+  sync: {
+    sleep: sleep,
+    clear: clearSync,
+    getPixel: getPixelSync,
+    setPixel: setPixelSync,
+    getPixels: getPixelsSync,
+    setPixels: setPixelsSync,
+    flipH: flipHSync,
+    flipV: flipVSync,
+    setRotation: setRotationSync,
+    showMessage: showMessageSync,
+    flashMessage: flashMessageSync,
+    showLetter: showLetterSync,
+    loadImage: loadImageSync,
+    get rotation() {
+      return rotation;
+    },
+    set rotation(r) {
+      setRotationSync(r, true);
+    },
+    get gamma() {
+      return getGamma();
+    },
+    set gamma(arr) {
+      setGamma(arr);
+    },
+    gammaReset: gammaReset,
+    get lowLight() {
+      return isLowLight();
+    },
+    set lowLight(bol) {
+      return setLowLight(bol);
+    }
+  }
+};
