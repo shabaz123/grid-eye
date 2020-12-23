@@ -7,3 +7,4 @@ other platforms too.
 
 For more information, see Element14
 
+For instructions on how to install this software on a Raspberry Pi 4 with Ubuntu 20.04 LTS 64 bit, you can consult these instructions on https://how2s.org/index.php/How_to_get_a_Panasonic_Grid-EYE_to_work_with_a_Raspberry_Pi_4
